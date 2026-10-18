@@ -1,42 +1,33 @@
 # Tennis Action Recognition Demo
 
-This is a first-version, in-browser tennis action recognition demo.
+This repository contains a browser-based tennis action recognition demo.
 
-Features
-- Real-time webcam capture
-- MediaPipe Pose landmarks extraction
-- In-browser sample collection (record ~30-frame windows per action)
-- Train a small TensorFlow.js model in the browser
-- Real-time inference using a sliding window
+What's new in this improved version
+- Fixed sampling FPS and stable windowing
+- Better landmark normalization (translation + rotation + scale)
+- Uses a small 1D-CNN (conv1d) for temporal modeling
+- Prediction smoothing and confidence thresholding
+- Model persistence: saved/loaded from IndexedDB (tfjs) and file load option
+- Export/import collected samples for offline training
 
-Actions (default): serve, forehand, backhand, volley, smash, ready
-
-Quick start (local)
-
-1. Clone
-
-   git clone https://github.com/gold666111/tennis-action-recognition-demo.git
-   cd tennis-action-recognition-demo
-
-2. Install
-
+Quick start
+1. Install
    npm install
-
-3. Run
-
+2. Run dev server
    npm run dev
+3. Open http://localhost:5173 on your device and allow camera access
 
-4. Open the page (usually http://localhost:5173) on a laptop or phone browser that allows camera access.
+Training & demo
+- Use the UI to record samples (recommended 10+ per action) and train in browser.
+- After training the model is saved to IndexedDB automatically.
+- You can export collected samples (JSON) and train a larger model offline (see scripts/)
 
-Usage
-- Select an action, press Record to capture one sample (~30 frames). Repeat to collect multiple samples per action.
-- When you have several samples across classes, press Train to train a small model in the browser.
-- After training, live predictions should appear while you perform actions.
+Offline training
+- If you want to train on desktop/server with more data, export samples to JSON and run a Python training script (examples in scripts/). After training convert the SavedModel to TF.js format:
 
-Notes & next steps
-- This is a minimal first version. Next improvements:
-  - Add example dataset and pre-trained model for immediate demo without collecting samples
-  - Improve preprocessing (rotation normalization / scale invariance)
-  - Use a recurrent or temporal model (1D conv / LSTM / Transformer)
-  - Add server-side training & model hosting for persistence
+  pip install tensorflow tensorflowjs
+  python scripts/train_offline.py --data exported_samples.json --out saved_model
+  tensorflowjs_converter --input_format=tf_saved_model --output_format=tfjs_layers_model saved_model/web_model saved_model_tfjs
+
+- Upload the generated web_model (model.json + shard .bin) to the web app using the "Load TF.js model" control.
 

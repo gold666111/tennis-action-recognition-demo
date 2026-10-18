@@ -7,10 +7,16 @@ import * as drawUtils from '@mediapipe/drawing_utils'
 // Actions (fixed)
 const ACTIONS = ['serve', 'forehand', 'backhand', 'volley', 'smash', 'ready']
 const WINDOW_SIZE = 30 // frames
+const TARGET_FPS = 15
+
+// selected landmark indices (MediaPipe 33-keypoints)
+const LANDMARK_INDICES = [11,12,13,14,15,16,23,24,25,26,27,28]
+const FEATURE_DIM_PER_POINT = 3 // x,y,z
+const FEATURE_DIM = LANDMARK_INDICES.length * FEATURE_DIM_PER_POINT * 2 // position + delta
 
 type Sample = {
   label: number
-  frames: number[][] // array of flattened landmarks per frame
+  frames: number[][] // array of feature vectors per frame
 }
 
 export default function CameraPose() {
@@ -22,9 +28,23 @@ export default function CameraPose() {
   const slidingWindow = useRef<number[][]>([])
   const [model, setModel] = useState<tf.LayersModel | null>(null)
   const [predictions, setPredictions] = useState<number[] | null>(null)
+  const predictionHistory = useRef<number[][]>([])
+  const lastSampleTs = useRef<number>(0)
+  const lastLandmarks = useRef<number[] | null>(null)
+  const recordingIndex = useRef<number | null>(null) // index of current recording sample in samples array
 
   useEffect(() => {
     startCamera()
+    // try load model from indexeddb
+    (async () => {
+      try {
+        const m = await tf.loadLayersModel('indexeddb://tennis-model-v1')
+        setModel(m)
+        console.log('Loaded model from IndexedDB')
+      } catch (e) {
+        console.log('No model in IndexedDB')
+      }
+    })()
   }, [])
 
   async function startCamera() {
@@ -59,13 +79,13 @@ export default function CameraPose() {
     })
     pose.onResults(onResults)
 
-    async function sendFrame() {
+    async function sendFrame(ts?: number) {
       if (!videoRef.current) return
       await pose.send({image: videoRef.current})
       requestAnimationFrame(sendFrame)
     }
 
-    sendFrame()
+    requestAnimationFrame(sendFrame)
   }
 
   function onResults(results: Results) {
@@ -73,19 +93,26 @@ export default function CameraPose() {
     const lm = results.poseLandmarks
     if (!lm) return
 
-    const flat = flattenLandmarks(lm)
-    // maintain sliding window
-    slidingWindow.current.push(flat)
+    // sampling at fixed FPS
+    const now = performance.now()
+    if (now - lastSampleTs.current < 1000 / TARGET_FPS) {
+      return
+    }
+    lastSampleTs.current = now
+
+    const features = normalizeAndExtractFeatures(lm)
+
+    // sliding window (for inference)
+    slidingWindow.current.push(features)
     if (slidingWindow.current.length > WINDOW_SIZE) slidingWindow.current.shift()
 
     // if collecting sample
-    if (status === 'recording') {
-      // append to current last sample frames
+    if (status === 'recording' && recordingIndex.current !== null) {
       setSamples(prev => {
         const copy = [...prev]
-        const last = copy[copy.length - 1]
+        const last = copy[recordingIndex.current!]
         if (last && last.frames.length < WINDOW_SIZE) {
-          last.frames.push(flat)
+          last.frames.push(features)
         }
         return copy
       })
@@ -93,13 +120,18 @@ export default function CameraPose() {
 
     // inference if model available and window filled
     if (model && slidingWindow.current.length === WINDOW_SIZE) {
-      const input = tf.tensor([slidingWindow.current.flat()])
+      const input = tf.tensor(slidingWindow.current).expandDims(0) // [1, WINDOW_SIZE, feat]
       const pred = (model.predict(input) as tf.Tensor)
-      const probs = pred.arraySync() as number[][]
-      setPredictions(probs[0])
-      input.dispose()
-      pred.dispose()
+      const probs = (pred.arraySync() as number[][])[0]
+      // smoothing
+      predictionHistory.current.push(probs)
+      if (predictionHistory.current.length > 5) predictionHistory.current.shift()
+      const avg = averagePredictions(predictionHistory.current)
+      setPredictions(avg)
+      input.dispose(); pred.dispose()
     }
+
+    lastLandmarks.current = features
   }
 
   function drawCanvas(results: Results) {
@@ -121,32 +153,67 @@ export default function CameraPose() {
     ctx.restore()
   }
 
-  function flattenLandmarks(landmarks: any[]) {
-    // normalize by hip center and scale by torso size
-    const xs = landmarks.map(l => l.x)
-    const ys = landmarks.map(l => l.y)
-    const cx = (xs[23] + xs[24]) / 2 // left/right hip
-    const cy = (ys[23] + ys[24]) / 2
-    const torsoSize = Math.hypot(xs[11] - xs[12], ys[11] - ys[12]) + 1e-6
+  function normalizeAndExtractFeatures(landmarks: any[]) {
+    // select important points
+    const pts = LANDMARK_INDICES.map(i => landmarks[i] || {x:0,y:0,z:0})
+    const hip = { x: ((landmarks[23]?.x||0) + (landmarks[24]?.x||0)) / 2, y: ((landmarks[23]?.y||0) + (landmarks[24]?.y||0)) / 2 }
+    const lShoulder = landmarks[11] || {x:0,y:0}
+    const rShoulder = landmarks[12] || {x:0,y:0}
+    const angle = Math.atan2(lShoulder.y - rShoulder.y, lShoulder.x - rShoulder.x)
+    const cos = Math.cos(-angle), sin = Math.sin(-angle)
+    const shoulderDist = Math.hypot(lShoulder.x - rShoulder.x, lShoulder.y - rShoulder.y) + 1e-6
 
-    const flat = landmarks.flatMap((p: any) => [ (p.x - cx)/torsoSize, (p.y - cy)/torsoSize, p.z || 0 ])
-    return flat
+    const pos: number[] = []
+    for (const p of pts) {
+      const dx = p.x - hip.x
+      const dy = p.y - hip.y
+      const rx = dx * cos - dy * sin
+      const ry = dx * sin + dy * cos
+      pos.push(rx / shoulderDist, ry / shoulderDist, p.z || 0)
+    }
+
+    // delta to previous frame
+    const delta: number[] = []
+    if (lastLandmarks.current) {
+      for (let i=0;i<pos.length;i++) {
+        delta.push(pos[i] - lastLandmarks.current[i])
+      }
+    } else {
+      for (let i=0;i<pos.length;i++) delta.push(0)
+    }
+
+    return [...pos, ...delta]
+  }
+
+  function averagePredictions(arr: number[][]) {
+    if (arr.length === 0) return null
+    const sum = new Array(arr[0].length).fill(0)
+    for (const a of arr) for (let i=0;i<a.length;i++) sum[i]+=a[i]
+    return sum.map(s => s/arr.length)
   }
 
   function startRecording() {
     // create new sample placeholder
+    const idx = samples.length
     setSamples(prev => [...prev, {label: selectedAction, frames: []}])
+    recordingIndex.current = idx
     setStatus('recording')
-    // stop recording after enough frames
+
+    // stop recording when window full or after timeout
+    const maxTime = Math.ceil((WINDOW_SIZE / TARGET_FPS) * 1000 + 500)
     setTimeout(() => {
       setStatus('camera-ready')
-    }, WINDOW_SIZE * 40) // ~40ms per frame -> ~WINDOW_SIZE frames
+      recordingIndex.current = null
+    }, maxTime)
   }
 
   function clearSamples() {
     setSamples([])
     setPredictions(null)
     setModel(null)
+    predictionHistory.current = []
+    // remove saved model
+    tf.io.removeModel('indexeddb://tennis-model-v1').catch(()=>{})
   }
 
   async function trainModel() {
@@ -156,6 +223,7 @@ export default function CameraPose() {
     const ys: number[][] = []
     for (const s of samples) {
       if (s.frames.length !== WINDOW_SIZE) continue
+      // s.frames is array of [feat] per frame; produce [WINDOW_SIZE, feat]
       xs.push(s.frames.flat())
       const one = new Array(ACTIONS.length).fill(0)
       one[s.label] = 1
@@ -163,23 +231,79 @@ export default function CameraPose() {
     }
     if (xs.length === 0) return alert('No complete samples (need full windows)')
 
-    const inputDim = xs[0].length
-    const xsTensor = tf.tensor2d(xs)
+    const featureDim = samples[0].frames[0].length
+    const xvals = new Float32Array(xs.length * WINDOW_SIZE * featureDim)
+    for (let i=0;i<xs.length;i++) {
+      const flat = xs[i]
+      for (let j=0;j<flat.length;j++) xvals[i * flat.length + j] = flat[j]
+    }
+    const xsTensor = tf.tensor(xvals, [xs.length, WINDOW_SIZE, featureDim])
     const ysTensor = tf.tensor2d(ys)
 
-    const m = tf.sequential()
-    m.add(tf.layers.dense({units: 128, activation: 'relu', inputShape: [inputDim]}))
-    m.add(tf.layers.dropout({rate: 0.3}))
-    m.add(tf.layers.dense({units: ACTIONS.length, activation: 'softmax'}))
-
-    m.compile({optimizer: tf.train.adam(0.001), loss: 'categoricalCrossentropy', metrics: ['acc']})
+    const m = createConv1DModel(WINDOW_SIZE, featureDim, ACTIONS.length)
 
     setStatus('training')
-    await m.fit(xsTensor, ysTensor, {epochs: 30, batchSize: Math.min(16, xs.length)})
+    await m.fit(xsTensor, ysTensor, {epochs: 40, batchSize: Math.min(16, xs.length)})
     setModel(m)
     setStatus('camera-ready')
     xsTensor.dispose(); ysTensor.dispose()
-    alert('Training finished. Model ready for real-time inference.')
+
+    // save to indexeddb
+    await m.save('indexeddb://tennis-model-v1')
+    alert('Training finished. Model saved to IndexedDB and ready for real-time inference.')
+  }
+
+  function createConv1DModel(windowSize: number, featureDim: number, numClasses: number) {
+    const model = tf.sequential()
+    model.add(tf.layers.inputLayer({inputShape: [windowSize, featureDim]}))
+    model.add(tf.layers.conv1d({filters: 32, kernelSize: 3, activation: 'relu'}))
+    model.add(tf.layers.conv1d({filters: 64, kernelSize: 3, activation: 'relu'}))
+    model.add(tf.layers.globalAveragePooling1d())
+    model.add(tf.layers.dropout({rate: 0.3}))
+    model.add(tf.layers.dense({units: numClasses, activation: 'softmax'}))
+    model.compile({optimizer: tf.train.adam(0.001), loss: 'categoricalCrossentropy', metrics: ['acc']})
+    return model
+  }
+
+  function exportSamples() {
+    const data = JSON.stringify({window: WINDOW_SIZE, fps: TARGET_FPS, samples})
+    const blob = new Blob([data], {type: 'application/json'})
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = 'tennis_samples.json'
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  function importSamples(e: React.ChangeEvent<HTMLInputElement>) {
+    const f = e.target.files?.[0]
+    if (!f) return
+    const reader = new FileReader()
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(reader.result as string)
+        if (parsed.samples) setSamples(parsed.samples)
+        alert('Samples imported')
+      } catch (err) { alert('Invalid file') }
+    }
+    reader.readAsText(f)
+  }
+
+  async function loadModelFromFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const f = e.target.files?.[0]
+    if (!f) return
+    const url = URL.createObjectURL(f)
+    try {
+      const m = await tf.loadLayersModel(url)
+      setModel(m)
+      await m.save('indexeddb://tennis-model-v1')
+      alert('Model loaded and saved to IndexedDB')
+    } catch (err) {
+      alert('Failed to load model')
+    } finally {
+      URL.revokeObjectURL(url)
+    }
   }
 
   return (
@@ -198,6 +322,12 @@ export default function CameraPose() {
               ))}
             </ul>
           ) : <p>—</p>}
+          {predictions && (function(){
+            const maxIdx = predictions.indexOf(Math.max(...predictions))
+            const conf = predictions[maxIdx]
+            if (conf > 0.6) return <div><strong>Detected:</strong> {ACTIONS[maxIdx]} ({(conf*100).toFixed(0)}%)</div>
+            return <div><em>Confidence too low</em></div>
+          })()}
         </div>
       </div>
 
@@ -210,7 +340,7 @@ export default function CameraPose() {
           <div className="controls">
             <button onClick={startRecording}>Record sample (auto stop after window)</button>
             <button onClick={trainModel}>Train in browser</button>
-            <button onClick={clearSamples}>Clear samples</button>
+            <button onClick={clearSamples}>Clear samples & remove model</button>
           </div>
         </section>
 
@@ -222,6 +352,15 @@ export default function CameraPose() {
               <li key={idx}>{ACTIONS[s.label]} — {s.frames.length}/{WINDOW_SIZE} frames</li>
             ))}
           </ol>
+          <div style={{marginTop:8}}>
+            <button onClick={exportSamples}>Export samples (JSON)</button>
+            <input type="file" accept="application/json" onChange={importSamples} />
+          </div>
+
+          <div style={{marginTop:8}}>
+            <label>Load TF.js model (.json): </label>
+            <input type="file" accept="application/json" onChange={loadModelFromFile} />
+          </div>
         </section>
 
         <section>
@@ -233,9 +372,9 @@ export default function CameraPose() {
           <h3>Instructions</h3>
           <ol>
             <li>Allow camera access. Aim to show full body (or at least upper body + racket).</li>
-            <li>Select an action, press Record and perform the action — the demo captures ~30 frames.</li>
+            <li>Select an action, press Record and perform the action — the demo captures ~{WINDOW_SIZE} frames at {TARGET_FPS}fps.</li>
             <li>Collect several samples per action (recommended 10+), then Train.</li>
-            <li>After training, perform actions and watch live predictions.</li>
+            <li>After training, perform actions and watch live predictions. Model persists in browser IndexedDB.</li>
           </ol>
         </section>
       </div>
